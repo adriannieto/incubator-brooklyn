@@ -18,9 +18,10 @@
  */
 package org.apache.brooklyn.entity.webapp;
 
+import org.apache.brooklyn.entity.software.base.AllowsMigration;
 import org.apache.brooklyn.entity.software.base.SoftwareProcess;
 
-public interface JavaWebAppSoftwareProcess extends SoftwareProcess, JavaWebAppService, JavaWebAppService.CanDeployAndUndeploy {
+public interface JavaWebAppSoftwareProcess extends SoftwareProcess, JavaWebAppService, JavaWebAppService.CanDeployAndUndeploy, AllowsMigration {
     
     // exist on the interface for freemarker to pick it up
     

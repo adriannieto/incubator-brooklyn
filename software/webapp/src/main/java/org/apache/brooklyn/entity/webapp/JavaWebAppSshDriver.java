@@ -18,21 +18,22 @@
  */
 package org.apache.brooklyn.entity.webapp;
 
-import static com.google.common.base.Preconditions.checkNotNull;
-
-import java.io.File;
-import java.net.URI;
-import java.util.Set;
-
+import com.google.common.collect.ImmutableList;
 import org.apache.brooklyn.core.entity.Attributes;
 import org.apache.brooklyn.entity.java.JavaSoftwareProcessSshDriver;
+import org.apache.brooklyn.entity.java.UsesJmx;
+import org.apache.brooklyn.feed.jmx.JmxHelper;
 import org.apache.brooklyn.location.ssh.SshMachineLocation;
 import org.apache.brooklyn.util.core.task.DynamicTasks;
 import org.apache.brooklyn.util.core.task.Tasks;
 import org.apache.brooklyn.util.core.task.ssh.SshTasks;
 import org.apache.brooklyn.util.text.Strings;
 
-import com.google.common.collect.ImmutableList;
+import java.io.File;
+import java.net.URI;
+import java.util.Set;
+
+import static com.google.common.base.Preconditions.checkNotNull;
 
 public abstract class JavaWebAppSshDriver extends JavaSoftwareProcessSshDriver implements JavaWebAppDriver {
 
@@ -106,8 +107,12 @@ public abstract class JavaWebAppSshDriver extends JavaSoftwareProcessSshDriver i
     @Override
     public void postLaunch() {
         String rootUrl = inferRootUrl();
-        entity.setAttribute(Attributes.MAIN_URI, URI.create(rootUrl));
-        entity.setAttribute(WebAppService.ROOT_URL, rootUrl);
+        entity.sensors().set(Attributes.MAIN_URI, URI.create(rootUrl));
+        entity.sensors().set(WebAppService.ROOT_URL, rootUrl);
+
+        // JMX_SERVICE_URL is not updated properly when the locations changes so we update in postlaunch to avoid
+        // isRunning to fail finding the right location to check.
+        entity.sensors().set(UsesJmx.JMX_URL, JmxHelper.toJmxmpUrl(getHostname(), getJmxPort()));
     }
 
     /** 

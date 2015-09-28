@@ -26,9 +26,15 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
+import com.google.common.collect.Lists;
 import org.apache.brooklyn.api.entity.Entity;
+import org.apache.brooklyn.api.location.Location;
 import org.apache.brooklyn.core.annotation.Effector;
 import org.apache.brooklyn.core.annotation.EffectorParam;
+import org.apache.brooklyn.core.entity.Entities;
+import org.apache.brooklyn.core.entity.lifecycle.Lifecycle;
+import org.apache.brooklyn.core.entity.lifecycle.ServiceStateLogic;
+import org.apache.brooklyn.core.entity.trait.Startable;
 import org.apache.brooklyn.entity.java.JavaAppUtils;
 import org.apache.brooklyn.entity.software.base.SoftwareProcessImpl;
 import org.slf4j.Logger;
@@ -200,6 +206,77 @@ public abstract class JavaWebAppSoftwareProcessImpl extends SoftwareProcessImpl 
     public String getHttpsSslKeystorePassword() {
         HttpsSslConfig config = getAttribute(HTTPS_SSL_CONFIG);
         return (config == null) ? "" : config.getKeystorePassword();
+    }
+
+    @Override
+    public void migrate(@EffectorParam(name = "locationSpec", description = "Location Spec", nullable = false) String locationSpec) {
+
+        if (ServiceStateLogic.getExpectedState(this) != Lifecycle.RUNNING) {
+            // Is it necessary to check if the whole application is healthy?
+            throw new RuntimeException("The entity needs to be healthy before the migration starts");
+        }
+
+        if (getParent() != null && !getParent().equals(getApplication())) {
+            /*
+             * TODO: Allow nested entites to be migrated
+             * If the entity has a parent different to the application root the migration cannot be done right now,
+             * as it could lead into problems to deal with hierarchies like SameServerEntity -> Entity
+             */
+
+            throw new RuntimeException("Nested entities cannot be migrated right now");
+        }
+
+        // Retrieving the location from the catalog.
+        Location newLocation = getManagementContext().getLocationRegistry().resolve(locationSpec);
+
+        // TODO: Find a better way to check if you're migrating an entity to the exactly same VM. This not always works.
+        for(Location oldLocation : getLocations()){
+            if(oldLocation.containsLocation(newLocation))
+                throw new RuntimeException("You cannot migrate an entity to the same location");
+        }
+
+        /*
+         *   BUG: Currently the status is not propagated to the parent it should retrieve it from the children,
+         *   but it seems that the descendant children status is not propagated properly
+         */
+        LOG.info("Migration process of " + this.getId() + " started.");
+
+        // When we have the new location, we free the resources of the current instance
+        stop();
+
+        // Clearing old locations to remove the relationship with the previous instance
+        clearLocations();
+        addLocations(Lists.newArrayList(newLocation));
+
+        // Starting the new instance
+        start(getLocations());
+
+        // Refresh all the dependant entities
+        refreshDependantEntities();
+
+        LOG.info("Migration process of " + this.getId() + " finished.");
+
+    }
+
+    /*
+     * TODO: Find a better way to refresh the application configuration.
+     */
+    private void refreshDependantEntities() {
+
+        // TODO: Refresh nested entities or find a way to propagate the restart properly.
+        for (Entity entity : getApplication().getChildren()) {
+
+            // Restart any entity but the migrated one.
+            if (entity instanceof Startable) {
+                if(this.equals(entity)){
+                    //The entity is sensors should rewired automatically on stop() + restart()
+                }else{
+                    // Restart the entity to fetch again all the dependencies (ie. attributeWhenReady ones)
+                    ((Startable) entity).restart();
+                }
+            }
+        }
+
     }
 
 }
