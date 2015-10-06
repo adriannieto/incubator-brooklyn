@@ -38,8 +38,8 @@ import org.apache.brooklyn.feed.ssh.SshPollValue;
 import org.apache.brooklyn.location.ssh.SshMachineLocation;
 import org.apache.brooklyn.util.collections.MutableMap;
 import org.apache.brooklyn.util.core.config.ConfigBag;
+import org.apache.brooklyn.util.core.task.DynamicTasks;
 import org.apache.brooklyn.util.core.task.ssh.SshTasks;
-import org.apache.brooklyn.util.core.task.system.ProcessTaskFactory;
 import org.apache.brooklyn.util.core.task.system.ProcessTaskWrapper;
 import org.apache.brooklyn.util.guava.Maybe;
 import org.apache.brooklyn.util.text.Identifiers;
@@ -201,12 +201,12 @@ public class MySqlNodeImpl extends SoftwareProcessImpl implements MySqlNode {
 
         // Save the required references to the old location, mainly the driver to be able to send commands to the old
         // machine, before stopping it in order to transfer the data.
-        MySqlDriver oldDriver = getDriver();
-        MachineProvisioningLocation oldProvisioningLocation = getProvisioningLocation();
-        String oldDbIp = sensors().get(ADDRESS);
-        Integer oldDbPort = sensors().get(MYSQL_PORT);
-        String dbPassword = sensors().get(PASSWORD);
-
+        final MySqlSshDriver oldDriver = (MySqlSshDriver) getDriver();
+        final MachineProvisioningLocation oldProvisioningLocation = getProvisioningLocation();
+        final String oldIp = sensors().get(ADDRESS);
+        final Integer oldPort = sensors().get(MYSQL_PORT);
+        final String oldSocketUid = sensors().get(SOCKET_UID);
+        final String dbPassword = sensors().get(PASSWORD);
 
         // Clearing old locations to remove the relationship with the previous instance
         clearLocations();
@@ -219,37 +219,81 @@ public class MySqlNodeImpl extends SoftwareProcessImpl implements MySqlNode {
         disconnectSensors();
         connectSensors();
 
-        String newIp = sensors().get(ADDRESS);
-        Integer newPort = sensors().get(MYSQL_PORT);
+        DynamicTasks.queue("synchronize-data", new Runnable() { public void run() {
+            //TODO: lock the database before migrating the data
+            ServiceStateLogic.setExpectedState(MySqlNodeImpl.this, Lifecycle.STARTING);
+            synchronizeData(oldDriver, oldDriver.getBaseDir(), oldSocketUid, oldIp, oldPort, dbPassword);
+            refreshDependantEntities();
+            ServiceStateLogic.setExpectedState(MySqlNodeImpl.this, Lifecycle.RUNNING);
 
-        synchronizeData(oldDriver, oldDbIp, oldDbPort, newIp, newPort, dbPassword);
+        }});
+
+        DynamicTasks.queue("release-old-machine", new Runnable() { public void run() {
+            ServiceStateLogic.setExpectedState(MySqlNodeImpl.this, Lifecycle.STARTING);
+            oldProvisioningLocation.release((MachineLocation) oldDriver.getLocation());
+            ServiceStateLogic.setExpectedState(MySqlNodeImpl.this, Lifecycle.RUNNING);
+        }});
 
         // When we have the new location, we free the resources of the current instance
-        oldProvisioningLocation.release((MachineLocation) oldDriver.getLocation());
 
-        // Refresh all the dependant entities
-        refreshDependantEntities();
 
         LOG.info("Migration process of " + this.getId() + " finished.");
 
     }
 
-    private void synchronizeData(MySqlDriver oldDriver, String oldIp, Integer oldPort, String newIp, Integer newPort, String dbPassword) {
-        Maybe<SshMachineLocation> sshMachineLocation = Locations.findUniqueSshMachineLocation(getLocations());
 
-        if (sshMachineLocation.isPresent()) {
-            MySqlSshDriver driver = (MySqlSshDriver) getDriver();
+    // TODO: Allow non SSH entities to be migrated, PaaS entities will not be able to proceed like this way.
+    // TODO: Handle errors and perform rollback if something fails
+    private void synchronizeData(MySqlSshDriver oldDriver, String oldBaseDir, String oldSocketUid, String oldIp, Integer oldPort, String dbPassword) {
+        SshMachineLocation oldSshMachine = oldDriver.getLocation();
+        Maybe<SshMachineLocation> newSshMachine = Locations.findUniqueSshMachineLocation(getLocations());
 
-            String command = format("%s/bin/mysqldump --all-databases -h%s -P%s -uroot -p%s | %s/bin/mysql  -h%s -P%s -uroot -p%s",
-                    driver.getBaseDir(), oldIp, oldPort, dbPassword, driver.getBaseDir(), newIp, newPort, dbPassword);
 
-            ProcessTaskFactory<String> mysqlDumpTask = SshTasks.newSshExecTaskFactory(sshMachineLocation.get(), command).requiringZeroAndReturningStdout();
-            ProcessTaskWrapper<String> taskResult = Entities.submit(this, mysqlDumpTask).block();
+        if (newSshMachine.isPresent()) {
+            String newBaseDir = ((MySqlSshDriver) getDriver()).getBaseDir();
+            String newSocketUid = sensors().get(SOCKET_UID);
+            String newAddress = sensors().get(ADDRESS);
+            Integer newPort = sensors().get(MYSQL_PORT);
+
+            ProcessTaskWrapper<String> taskResult;
+
+            // This allows the new machine to retrieve the dump from the old machine
+            String preMigrationCmd = format(
+                    "%s/bin/mysql -uroot -p%s --protocol=socket -S /tmp/mysql.sock.%s.%s -B " +
+                    "-e \"GRANT ALL ON *.* to root@'%s' IDENTIFIED BY '%s'\";",
+                    oldBaseDir, dbPassword, oldSocketUid, oldPort, newAddress, dbPassword);
+            taskResult = Entities.submit(this,
+                    SshTasks.newSshExecTaskFactory(oldSshMachine, preMigrationCmd).requiringZeroAndReturningStdout()).block();
 
             if (taskResult.getExitCode() != 0) {
                 throw new RuntimeException("The database dump failed");
             }
 
+            // Dumps the old database and pipes to the new MySql instance
+            String migrateDataCmd = format("%s/bin/mysqldump --all-databases -uroot -p%s -h%s -P%s  | %s/bin/mysql   -uroot -p%s --protocol=socket -S /tmp/mysql.sock.%s.%s",
+                    oldBaseDir, dbPassword, oldIp, oldPort, newBaseDir, dbPassword, newSocketUid, newPort);
+            taskResult = Entities.submit(this,
+                    SshTasks.newSshExecTaskFactory(newSshMachine.get(), migrateDataCmd).requiringZeroAndReturningStdout()).block();
+
+            if (taskResult.getExitCode() != 0) {
+                throw new RuntimeException("The database dump failed" +
+                        "");
+            }
+
+            // TODO: Restore back the permissions in the new machine (they were transferred in the dump)
+            /*
+                String postMigrationCmd = format(
+                        "%s/bin/mysql -uroot -p%s --protocol=socket -S /tmp/mysql.sock.%s.%s -B " +
+                                "-e GRANT ALL ON *.* to root@'%s' IDENTIFIED BY '%s';",
+                        oldBaseDir, dbPassword, oldSocketUid, oldPort, newAddress, dbPassword);
+                taskResult = Entities.submit(this,
+                        SshTasks.newSshExecTaskFactory(newSshMachine.get(), postMigrationCmd).requiringZeroAndReturningStdout()).block();
+
+                if (taskResult.getExitCode() != 0) {
+                    throw new RuntimeException("The database dump failed" +
+                            "");
+                }
+            */
         } else {
             throw new RuntimeException("The machine is not available.");
         }
